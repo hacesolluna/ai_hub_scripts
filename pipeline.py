@@ -456,5 +456,347 @@ def profile_compiled_onnx_model(model_id: str):
         print(e)
         print(f"Open profile manually: {profile_job.url}")
 
+@app.function(
+    gpu="A100-40GB",
+    image=base_image,
+    volumes={"/cache": vol},
+    timeout=3600,
+)
+def build_calibration_data(
+    num_samples: int = 2,
+    prompt_length: int = 128,
+    image_size: int = 224,
+):
+    vol.reload()
+
+    import os
+    import numpy as np
+    from PIL import Image
+    from transformers import AutoProcessor
+
+    weights_dir = "/cache/weights"
+    out_dir = "/cache/onnx_full/calibration"
+    os.makedirs(out_dir, exist_ok=True)
+
+    processor = AutoProcessor.from_pretrained(
+        weights_dir,
+        trust_remote_code=True,
+    )
+
+    samples = {
+        "input_ids": [],
+        "attention_mask": [],
+        "mm_token_type_ids": [],
+        "pixel_values": [],
+        "image_grid_thw": [],
+    }
+
+    for i in range(num_samples):
+        img_array = np.full(
+            (image_size, image_size, 3),
+            fill_value=(i * 31) % 255,
+            dtype=np.uint8,
+        )
+        image = Image.fromarray(img_array)
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": "a " * prompt_length},
+                ],
+            }
+        ]
+
+        text = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        inputs = processor(
+            text=[text],
+            images=[image],
+            return_tensors="np",
+        )
+
+        for key in samples:
+            arr = inputs[key]
+
+            if key == "pixel_values":
+                arr = arr.astype(np.float32)
+            else:
+                arr = arr.astype(np.int64)
+
+            samples[key].append(arr)
+
+    save_dict = {}
+
+    for key, values in samples.items():
+        print(key, len(values), values[0].shape, values[0].dtype)
+
+        for i, arr in enumerate(values):
+            save_dict[f"{key}_{i}"] = arr
+
+    cal_path = f"{out_dir}/calibration_data_list_format.npz"
+    np.savez(cal_path, **save_dict)
+
+    vol.commit()
+
+    print(f"✓ Saved calibration data to {cal_path}")
+
+@app.function(
+    gpu="A100-40GB",
+    image=base_image,
+    volumes={"/cache": vol},
+    secrets=[modal.Secret.from_name("qai-hub-secret")],
+    timeout=7200,
+)
+def quantize_full_onnx_int8(num_samples: int = 2):
+    vol.reload()
+
+    import os
+    import numpy as np
+    import onnxruntime as ort
+    import qai_hub as hub
+
+    onnx_path = "/cache/onnx_full/full_model_fp32.onnx"
+    upload_dir = "/cache/onnx_full_upload"
+    cal_path = "/cache/onnx_full/calibration/calibration_data_list_format.npz"
+
+    if not os.path.exists(onnx_path):
+        raise FileNotFoundError(f"Missing ONNX file: {onnx_path}")
+
+    if not os.path.isdir(upload_dir):
+        raise FileNotFoundError(
+            f"Missing upload directory: {upload_dir}. "
+            f"Run your prepare ONNX upload step first."
+        )
+
+    if not os.path.exists(cal_path):
+        raise FileNotFoundError(
+            f"Missing calibration data: {cal_path}. "
+            f"Run build_calibration_data first."
+        )
+
+    token = os.environ.get("QAI_HUB_API_TOKEN")
+    client = hub.Client(config=hub.ClientConfig(api_token=token))
+
+    print("Reading actual ONNX inputs...")
+    session = ort.InferenceSession(
+        onnx_path,
+        providers=["CPUExecutionProvider"],
+    )
+
+    actual_input_names = [inp.name for inp in session.get_inputs()]
+
+    print("Actual ONNX inputs:")
+    for inp in session.get_inputs():
+        print(inp.name, inp.shape, inp.type)
+
+    data = np.load(cal_path)
+
+    calibration_data = {}
+
+    for key in actual_input_names:
+        calibration_data[key] = []
+
+        for i in range(num_samples):
+            npz_key = f"{key}_{i}"
+
+            if npz_key not in data:
+                raise KeyError(f"Missing calibration key: {npz_key}")
+
+            calibration_data[key].append(data[npz_key])
+
+    print("Calibration data passed to AI Hub:")
+    for k, values in calibration_data.items():
+        print(k, len(values), values[0].shape, values[0].dtype)
+
+    print("Uploading ONNX directory for quantization...")
+    uploaded_model = client.upload_model(upload_dir)
+    print(f"Uploaded source model ID: {uploaded_model.model_id}")
+
+    print("Submitting INT8 quantization job...")
+
+    # Some qai-hub versions expose QuantizeDtype; some accept strings.
+    try:
+        weights_dtype = hub.QuantizeDtype.INT8
+        activations_dtype = hub.QuantizeDtype.INT8
+    except AttributeError:
+        weights_dtype = "int8"
+        activations_dtype = "int8"
+
+    quant_job = client.submit_quantize_job(
+        model=uploaded_model,
+        calibration_data=calibration_data,
+        weights_dtype=weights_dtype,
+        activations_dtype=activations_dtype,
+        name="qwen35-vl-full-onnx-int8",
+    )
+
+    print(f"Quantize job: {quant_job.url}")
+
+    status = quant_job.wait()
+
+    print(f"Quantize status: {status.code}")
+    print(f"Quantize message: {status.message}")
+
+    if "FAILED" in str(status.code):
+        print(f"Quantization failed. Check: {quant_job.url}")
+        return
+
+    quantized_model = quant_job.get_target_model()
+
+    with open("/cache/onnx_full/quantized_onnx_model_id.txt", "w") as f:
+        f.write(quantized_model.model_id)
+
+    vol.commit()
+
+    print(f"✓ Quantized model ID: {quantized_model.model_id}")
+    print(f"✓ Quantize job: {quant_job.url}")
+
+@app.function(
+    image=base_image,
+    volumes={"/cache": vol},
+    secrets=[modal.Secret.from_name("qai-hub-secret")],
+    timeout=7200,
+)
+def compile_quantized_onnx_runtime():
+    vol.reload()
+
+    import os
+    import qai_hub as hub
+
+    model_id_path = "/cache/onnx_full/quantized_onnx_model_id.txt"
+
+    if not os.path.exists(model_id_path):
+        raise FileNotFoundError(
+            f"Missing quantized model ID: {model_id_path}. "
+            f"Run quantize_full_onnx_int8 first."
+        )
+
+    with open(model_id_path, "r") as f:
+        quantized_model_id = f.read().strip()
+
+    if not quantized_model_id:
+        raise ValueError(f"Empty quantized model ID file: {model_id_path}")
+
+    token = os.environ.get("QAI_HUB_API_TOKEN")
+    if not token:
+        raise RuntimeError("QAI_HUB_API_TOKEN is not set.")
+
+    client = hub.Client(config=hub.ClientConfig(api_token=token))
+
+    print(f"Loading quantized model ID: {quantized_model_id}")
+    quantized_model = client.get_model(quantized_model_id)
+
+    device = hub.Device("QCS8550 (Proxy)")
+
+    print("Submitting compile job for quantized ONNX Runtime target...")
+
+    compile_job = client.submit_compile_job(
+        model=quantized_model,
+        device=device,
+        name="qwen35-vl-full-onnx-int8-runtime",
+        options="--target_runtime onnx",
+    )
+
+    print(f"Compile job: {compile_job.url}")
+
+    status = compile_job.wait()
+
+    print(f"Compile status: {status.code}")
+    print(f"Compile message: {status.message}")
+
+    if "FAILED" in str(status.code):
+        print(f"Compile failed. Check: {compile_job.url}")
+        return
+
+    compiled_model = compile_job.get_target_model()
+
+    compiled_model_id_path = "/cache/onnx_full/compiled_quantized_onnx_model_id.txt"
+
+    with open(compiled_model_id_path, "w") as f:
+        f.write(compiled_model.model_id)
+
+    vol.commit()
+
+    print(f"✓ Compiled quantized model ID: {compiled_model.model_id}")
+    print(f"✓ Saved compiled model ID to: {compiled_model_id_path}")
+    print(f"✓ Compile job: {compile_job.url}")
+
+
+@app.function(
+    gpu="A100-40GB",
+    image=base_image,
+    volumes={"/cache": vol},
+    secrets=[modal.Secret.from_name("qai-hub-secret")],
+    timeout=7200,
+)
+def profile_quantized_onnx_runtime(model_id: str = ""):
+    vol.reload()
+
+    import os
+    import qai_hub as hub
+
+    if model_id:
+        compiled_model_id = model_id
+    else:
+        model_id_path = "/cache/onnx_full/compiled_quantized_onnx_model_id.txt"
+
+        if not os.path.exists(model_id_path):
+            raise FileNotFoundError(
+                f"Missing compiled quantized model ID: {model_id_path}. "
+                f"Run compile_quantized_onnx_runtime first."
+            )
+
+        with open(model_id_path, "r") as f:
+            compiled_model_id = f.read().strip()
+
+    if not compiled_model_id:
+        raise ValueError("Compiled model ID is empty.")
+
+    token = os.environ.get("QAI_HUB_API_TOKEN")
+    if not token:
+        raise RuntimeError("QAI_HUB_API_TOKEN is not set.")
+
+    client = hub.Client(config=hub.ClientConfig(api_token=token))
+
+    print(f"Loading compiled quantized model ID: {compiled_model_id}")
+    compiled_model = client.get_model(compiled_model_id)
+
+    device = hub.Device("QCS8550 (Proxy)")
+
+    print("Submitting profile job...")
+    profile_job = client.submit_profile_job(
+        model=compiled_model,
+        device=device,
+        name="qwen35-vl-full-onnx-int8-runtime-profile",
+    )
+
+    print(f"Profile job: {profile_job.url}")
+
+    status = profile_job.wait()
+
+    print(f"Profile status: {status.code}")
+    print(f"Profile message: {status.message}")
+
+    if "FAILED" in str(status.code):
+        print(f"Profile failed. Check: {profile_job.url}")
+        return
+
+    print(f"✓ Profile complete: {profile_job.url}")
+
+    try:
+        profile = profile_job.download_profile()
+        print("Downloaded profile:")
+        print(profile)
+    except Exception as e:
+        print("Could not download profile directly.")
+        print(e)
+        print(f"Open manually: {profile_job.url}")
+
 # Quantization image — adds AIMET (Linux only, hence Modal)
 quant_image = base_image.pip_install("aimet-onnx")
